@@ -257,6 +257,10 @@ class OfflinePhraseRecognizer private constructor(
                 }
                 else -> enqueue(withLeadIn(segment.start, segment.samples), cutMidSpeech = false)
             }
+            // Everything up to here has been sent. In non-stop speech the detector splits it
+            // every VAD_MAX_SPEECH_SEC with almost no gap; without this, the next piece's
+            // lead-in reached back into audio already sent and repeated its last words.
+            lastCut = maxOf(lastCut, end)
             pieceStart = -1L
             speechLevel = 0f
             quietRun = 0
@@ -316,9 +320,12 @@ class OfflinePhraseRecognizer private constructor(
         return FloatArray((to - first).toInt()) { i -> recent[((first + i) % RECENT_SAMPLES).toInt()] }
     }
 
-    /** [samples] (starting at sample [start]) with up to [LEAD_IN_SAMPLES] of audio before them. */
+    /**
+     * [samples] (starting at sample [start]) with up to [LEAD_IN_SAMPLES] of audio before them,
+     * but none that was already sent (before [lastCut]).
+     */
     private fun withLeadIn(start: Int, samples: FloatArray): FloatArray {
-        val leadInStart = maxOf(0L, start - LEAD_IN_SAMPLES.toLong(), samplesFedToVad - RECENT_SAMPLES)
+        val leadInStart = maxOf(0L, lastCut, start - LEAD_IN_SAMPLES.toLong(), samplesFedToVad - RECENT_SAMPLES)
         val leadIn = (start - leadInStart).toInt()
         if (leadIn <= 0) return samples
         val out = FloatArray(leadIn + samples.size)

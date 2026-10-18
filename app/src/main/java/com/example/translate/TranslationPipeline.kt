@@ -1,5 +1,6 @@
 package com.example.translate
 
+import com.example.text.WritingSystem
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.channels.Channel
@@ -185,50 +186,13 @@ class LanguageDetectionGate {
             val bestOverall = candidates.maxByOrNull { it.second }
             if (bestOverall != null && bestOverall.second >= confidenceThreshold && !isUsable(bestOverall.first)) {
                 val remembered = lastConfidentLanguage
-                if (remembered != null && isUsable(remembered) && writingSystemOf(text) == writingSystemOfLanguage(remembered)) {
+                if (remembered != null && isUsable(remembered) && WritingSystem.majorityOf(text) == WritingSystem.ofLanguage(remembered)) {
                     return remembered
                 }
                 return bestOverall.first
             }
         }
         return resolve(usable, confidenceThreshold)
-    }
-
-    private fun writingSystemOf(text: String): String? =
-        text.filter { it.isLetter() }
-            .groupingBy { writingSystemOfChar(it) }
-            .eachCount()
-            .filterKeys { it != null }
-            .maxByOrNull { it.value }
-            ?.key
-
-    // Named after the Unicode script; Chinese characters and Japanese kana count as one ("cjk")
-    private fun writingSystemOfChar(c: Char): String? = when (val script = Character.UnicodeScript.of(c.code)) {
-        Character.UnicodeScript.HAN,
-        Character.UnicodeScript.HIRAGANA,
-        Character.UnicodeScript.KATAKANA -> "cjk"
-        Character.UnicodeScript.COMMON,
-        Character.UnicodeScript.INHERITED,
-        Character.UnicodeScript.UNKNOWN -> null
-        else -> script.name.lowercase()
-    }
-
-    private fun writingSystemOfLanguage(code: String): String = when (code) {
-        "ja", "zh" -> "cjk"
-        "ko" -> "hangul"
-        "ru", "uk", "bg", "be", "mk" -> "cyrillic"
-        "ar", "fa", "ur" -> "arabic"
-        "hi", "mr", "ne" -> "devanagari"
-        "bn" -> "bengali"
-        "gu" -> "gujarati"
-        "ta" -> "tamil"
-        "te" -> "telugu"
-        "kn" -> "kannada"
-        "th" -> "thai"
-        "el" -> "greek"
-        "he" -> "hebrew"
-        "ka" -> "georgian"
-        else -> "latin"
     }
 
     fun reset() {

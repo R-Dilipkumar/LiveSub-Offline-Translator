@@ -30,6 +30,8 @@ import com.example.translate.LocalTranslatorEngine
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.first
@@ -38,6 +40,8 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 
 class AudioCaptureService : Service() {
 
@@ -78,6 +82,10 @@ class AudioCaptureService : Service() {
         // AudioRecord (~43 ms at 48 kHz stereo, ~256 ms at 16 kHz mono), so this holds
         // roughly 11-60 s of audio. When full, the oldest chunk is dropped to keep recent audio.
         const val AUDIO_BUFFER_CAPACITY = 256
+        // At Stop: how long to wait for the audio thread to end, and for the recognizer to take
+        // the audio captured before Stop (beyond that the rest is skipped)
+        private const val AUDIO_THREAD_END_WAIT_MS = 3_000L
+        private const val DRAIN_WAIT_MS = 5_000L
 
         // Global state for UI to observe
         private val _isServiceRunning = MutableStateFlow(false)
@@ -644,10 +652,12 @@ class AudioCaptureService : Service() {
             // until this capture ends (see SpeechRecognizerEngine.initEngine).
             speechEngine.beginCapture()
 
-            // Consumer coroutine: pulls audio buffers and feeds to SpeechRecognizerEngine
+            // Consumer coroutine: pulls audio buffers and feeds to SpeechRecognizerEngine. After
+            // Stop it still feeds what was captured before it (the channel is closed then, so it
+            // ends there), unless a new capture has started meanwhile.
             val decodingConsumerJob = serviceScope.launch(Dispatchers.Default) {
                 for (chunk in audioBufferChannel) {
-                    if (!isCapturing || !isActive) break
+                    if (!isActive || captureGeneration != generation) break
                     speechEngine.feedAudioSamples(chunk)
                 }
             }
@@ -785,14 +795,8 @@ class AudioCaptureService : Service() {
                     } catch (_: Exception) {}
                     try { debugRecorder?.close() } catch (_: Exception) {}
                     noiseReducer?.release()
+                    // The last speech is flushed once the consumer has fed everything (below)
                     audioBufferChannel.close()
-                    // Must not throw out of this thread's cleanup (an uncaught exception here
-                    // would crash the app)
-                    try {
-                        speechEngine.flushCurrentSegment()
-                    } catch (t: Throwable) {
-                        Log.e(TAG, "Could not flush the last speech", t)
-                    }
                     _liveAudioDb.value = 0f
                 }
             }
@@ -814,10 +818,33 @@ class AudioCaptureService : Service() {
                 }
             } finally {
                 audioCaptureThread.interrupt()
-                decodingConsumerJob.cancel()
-                speechEngine.endCapture()
-                if (droppedAudioChunks > 0) {
-                    Log.w(TAG, "Capture ended with $droppedAudioChunks dropped audio chunk(s)")
+                // End the capture in order, also when Stop cancelled this job: the audio thread
+                // closes the channel, the consumer feeds the audio captured before Stop, then the
+                // last sentence is flushed, and only then is the engine told the capture ended.
+                // (Flushing from the audio thread while the consumer was still feeding let a
+                // chunk in after the flush, into the next capture.) The flush can wait for the
+                // model, so it runs on an IO thread.
+                withContext(NonCancellable + Dispatchers.IO) {
+                    try {
+                        audioCaptureThread.join(AUDIO_THREAD_END_WAIT_MS)
+                    } catch (_: InterruptedException) {
+                    }
+                    // Normally already closed by the audio thread; closing again does nothing
+                    audioBufferChannel.close()
+                    if (withTimeoutOrNull(DRAIN_WAIT_MS) { decodingConsumerJob.join() } == null) {
+                        Log.w(TAG, "Recognizer still busy with audio from before Stop; skipping the rest")
+                        decodingConsumerJob.cancelAndJoin()
+                    }
+                    // Must not throw out of this cleanup
+                    try {
+                        speechEngine.flushCurrentSegment()
+                    } catch (t: Throwable) {
+                        Log.e(TAG, "Could not flush the last speech", t)
+                    }
+                    speechEngine.endCapture()
+                    if (droppedAudioChunks > 0) {
+                        Log.w(TAG, "Capture ended with $droppedAudioChunks dropped audio chunk(s)")
+                    }
                 }
             }
         }
@@ -838,7 +865,7 @@ class AudioCaptureService : Service() {
         if (!modelManager.isDenoiserInstalled() && !triedDenoiserDownload) {
             triedDenoiserDownload = true
             try {
-                kotlinx.coroutines.withContext(Dispatchers.IO) { modelManager.ensureDenoiserInstalled() }
+                withContext(Dispatchers.IO) { modelManager.ensureDenoiserInstalled() }
             } catch (e: Exception) {
                 if (e is kotlinx.coroutines.CancellationException) throw e
                 Log.w(TAG, "Noise remover download failed; starting without it: ${e.message}")

@@ -3,6 +3,7 @@ package com.example.translate
 import android.content.Context
 import android.util.Log
 import com.example.service.NotificationHelper
+import com.example.text.WritingSystem
 import com.google.mlkit.common.model.DownloadConditions
 import com.google.mlkit.common.model.RemoteModelManager
 import com.google.mlkit.nl.languageid.LanguageIdentification
@@ -248,6 +249,8 @@ class LocalTranslatorEngine(private val context: Context) {
      * In ML Kit, non-English to non-English translations pivot through English, requiring the English model as well.
      */
     fun getRequiredLanguageCodes(srcCode: String, tgtCode: String): Set<String> {
+        // Same spoken and subtitle language (live captions): shown as heard, nothing to translate
+        if (srcCode == tgtCode) return emptySet()
         val codes = mutableSetOf(srcCode, tgtCode)
         if (srcCode != TranslateLanguage.ENGLISH && tgtCode != TranslateLanguage.ENGLISH) {
             codes.add(TranslateLanguage.ENGLISH)
@@ -290,6 +293,9 @@ class LocalTranslatorEngine(private val context: Context) {
                 val englishDownloaded = if (needsPivot) isModelDownloadedOnDisk(TranslateLanguage.ENGLISH) else true
 
                 _isModelMissing.value = !(tgtDownloaded && englishDownloaded)
+            } else if (srcLang.code == tgtLang.code) {
+                // Live captions in the spoken language: no pack is needed
+                _isModelMissing.value = false
             } else {
                 val srcDownloaded = isModelDownloadedOnDisk(srcLang.code)
                 val tgtDownloaded = isModelDownloadedOnDisk(tgtLang.code)
@@ -498,8 +504,22 @@ class LocalTranslatorEngine(private val context: Context) {
         val heardCode = request.languageHint?.let { TranslateLanguage.fromLanguageTag(it) }
         val detectedCode = when {
             !srcLang.isAutoDetect -> srcLang.code
-            // The speech model heard the language from the sound: trust it over the text
-            heardCode != null -> heardCode.also { languageDetectionGate.remember(it) }
+            // The speech model heard the language from the sound: trust it over a guess from
+            // the text, unless the letters plainly say otherwise. Whisper can label a short,
+            // noisy piece of Korean "en"; trusting that made the line "already English" and
+            // showed it untranslated.
+            heardCode != null -> {
+                val checked = WritingSystem.checkHeardLanguage(heardCode, text)
+                    ?.let { TranslateLanguage.fromLanguageTag(it) }
+                if (checked != null) {
+                    if (checked != heardCode) Log.d(TAG, "Heard $heardCode, but the text is written in $checked: \"$text\"")
+                    checked.also { languageDetectionGate.remember(it) }
+                } else {
+                    // Written in another shared script (Latin text heard as Korean): let the
+                    // text language detector decide
+                    detectSourceLanguage(text)
+                }
+            }
             else -> detectSourceLanguage(text)
         }
         if (detectedCode == null) {

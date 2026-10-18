@@ -3,6 +3,7 @@ package com.example.asr
 import android.content.Context
 import android.util.Log
 import com.example.service.NotificationHelper
+import com.example.text.WritingSystem
 import com.k2fsa.sherpa.onnx.EndpointConfig
 import com.k2fsa.sherpa.onnx.EndpointRule
 import com.k2fsa.sherpa.onnx.FeatureConfig
@@ -129,8 +130,6 @@ class SpeechRecognizerEngine(
     // Accuracy mode: phrases come with punctuation, so most complete at once; the waits only
     // matter for a phrase cut at a comma or without punctuation
     private val phraseAssembler = SentenceAssembler(pauseMs = 600L, continuationPauseMs = 1_200L)
-    // Language of the last recognized phrase (Accuracy mode)
-    private var lastPhraseLanguage: String? = null
     var joinSentencePieces: Boolean
         get() = sentenceAssembler.isEnabled
         set(value) {
@@ -174,13 +173,18 @@ class SpeechRecognizerEngine(
         /** Text of a piece cut mid-speech, without the sentence-ending mark the model added. */
         fun trimCutPieceEnding(text: String): String = text.trimEnd().trimEnd(*CUT_PIECE_ENDINGS).trimEnd()
 
-        /** Joins two pieces of recognized text: no space between CJK/Thai text, a space otherwise. */
+        /**
+         * Joins two pieces of recognized text: no space next to Chinese characters or kana, a
+         * space otherwise. Korean writes spaces between words, and Thai writes one between
+         * phrases (pieces are cut at pauses), so both get a space.
+         */
         fun joinFragments(first: String, second: String): String {
             if (first.isEmpty()) return second
             if (second.isEmpty()) return first
             val a = first.last()
             val b = second.first()
-            val needsSpace = (a.isLetterOrDigit() && a.code < 0x2E80) && (b.isLetterOrDigit() && b.code < 0x2E80)
+            val needsSpace = a.isLetterOrDigit() && b.isLetterOrDigit() &&
+                !WritingSystem.isUnspaced(a) && !WritingSystem.isUnspaced(b)
             return if (needsSpace) "$first $second" else first + second
         }
         // If audio keeps flowing but the recognizer produces no new text and no endpoint for
@@ -443,7 +447,6 @@ class SpeechRecognizerEngine(
         currentRawDraft = ""
         sentenceAssembler.clear()
         phraseAssembler.clear()
-        lastPhraseLanguage = null
         noiseTextFilter.reset()
         audioFeedingStarted = false
         synchronized(pcmChunkAccumulator) {
@@ -608,13 +611,24 @@ class SpeechRecognizerEngine(
             return
         }
         val full = withPendingFragment(text, now, consume = true)
-        val sentence = sentenceAssembler.onPiece(full, utteranceId, now)
-        if (sentence.isFinal) {
-            Log.d(TAG, "Speech endpoint reached (utteranceId=${sentence.utteranceId}). Emitting Final: ${sentence.text}")
-            emitFinalUtterance(sentence.text, sentence.utteranceId)
-        } else {
-            Log.d(TAG, "Piece held until the sentence ends (utteranceId=${sentence.utteranceId}): ${sentence.text}")
-            emitPartialUtterance(sentence.text, sentence.utteranceId)
+        // Models with punctuation (Kroko, X-ASR) can put several sentences in one piece: each
+        // becomes its own subtitle, as in Accuracy mode. The first keeps the draft's id, so it
+        // replaces the draft line; the others get newer ids.
+        for ((index, part) in SentenceAssembler.splitSentences(full).withIndex()) {
+            val partId = if (index == 0) utteranceId else utteranceEpochCounter.incrementAndGet()
+            // A piece in another writing system (English after Japanese) starts its own sentence
+            sentenceAssembler.breakBefore(part)?.let { waiting ->
+                Log.d(TAG, "Writing system changed: ending the waiting sentence (utteranceId=${waiting.utteranceId}): ${waiting.text}")
+                emitFinalUtterance(waiting.text, waiting.utteranceId)
+            }
+            val sentence = sentenceAssembler.onPiece(part, partId, now)
+            if (sentence.isFinal) {
+                Log.d(TAG, "Speech endpoint reached (utteranceId=${sentence.utteranceId}). Emitting Final: ${sentence.text}")
+                emitFinalUtterance(sentence.text, sentence.utteranceId)
+            } else {
+                Log.d(TAG, "Piece held until the sentence ends (utteranceId=${sentence.utteranceId}): ${sentence.text}")
+                emitPartialUtterance(sentence.text, sentence.utteranceId)
+            }
         }
     }
 
@@ -650,7 +664,7 @@ class SpeechRecognizerEngine(
             if (phraseRecognizer.takeSkippedCount() > 0) _isFallingBehind.value = true
             // A phrase cut at a comma waits briefly for the rest of its sentence
             phraseAssembler.onTick(now, isSpeaking = phraseRecognizer.isSpeaking)?.let { sentence ->
-                emitFinalUtterance(sentence.text, sentence.utteranceId, lastPhraseLanguage)
+                emitFinalUtterance(sentence.text, sentence.utteranceId, sentence.language)
                 _partialTextFlow.value = ""
             }
         } catch (t: Throwable) {
@@ -675,21 +689,27 @@ class SpeechRecognizerEngine(
         // the end of the sentence, so it must not end the sentence
         val piece = if (phrase.cutMidSpeech) trimCutPieceEnding(text) else text
         if (piece.isBlank()) return
-        phrase.language?.let { lastPhraseLanguage = it }
         // Each sentence in the piece becomes its own subtitle (line, card and history entry);
-        // an unfinished last part waits for the rest of its sentence
+        // an unfinished last part waits for the rest of its sentence. A sentence is translated
+        // from the language most of it was heard in (see SentenceAssembler).
         for (part in SentenceAssembler.splitSentences(piece)) {
+            // A piece in another writing system (English after Korean) starts its own sentence:
+            // a mixed sentence can only be translated from one of its languages
+            phraseAssembler.breakBefore(part)?.let { waiting ->
+                Log.d(TAG, "Writing system changed: ending the waiting sentence (utteranceId=${waiting.utteranceId}): ${waiting.text}")
+                emitFinalUtterance(waiting.text, waiting.utteranceId, waiting.language)
+            }
             val utteranceId = currentUtteranceId
             currentUtteranceId = utteranceEpochCounter.incrementAndGet()
-            val sentence = phraseAssembler.onPiece(part, utteranceId, now)
+            val sentence = phraseAssembler.onPiece(part, utteranceId, now, phrase.language)
             if (sentence.isFinal) {
-                emitFinalUtterance(sentence.text, sentence.utteranceId, lastPhraseLanguage)
+                emitFinalUtterance(sentence.text, sentence.utteranceId, sentence.language)
                 _partialTextFlow.value = ""
             } else {
                 // Translated right away as a draft, so subtitles show up every few seconds; the
                 // whole sentence replaces it once complete (and only that is saved to history)
                 _partialTextFlow.value = sentence.text
-                emitPartialUtterance(sentence.text, sentence.utteranceId, lastPhraseLanguage)
+                emitPartialUtterance(sentence.text, sentence.utteranceId, sentence.language)
             }
         }
     }
@@ -724,7 +744,7 @@ class SpeechRecognizerEngine(
             offlineRecognizer?.let { phraseRecognizer ->
                 val now = System.currentTimeMillis()
                 phraseRecognizer.flush().forEach { handlePhrase(it, now) }
-                phraseAssembler.flush()?.let { emitFinalUtterance(it.text, it.utteranceId, lastPhraseLanguage) }
+                phraseAssembler.flush()?.let { emitFinalUtterance(it.text, it.utteranceId, it.language) }
                 _partialTextFlow.value = ""
                 return
             }

@@ -46,6 +46,8 @@ Test builds are signed with a debug key, so Android may warn that the developer 
 
 **Preferred latency** (Settings): **Instant** uses a streaming model, so words appear while spoken. **About 1 second** uses a whole-phrase model: text appears sentence by sentence, usually within a few seconds, with punctuation and far fewer mistakes. Each latency keeps its own model.
 
+**Background noise removal** (Settings): cleans crowd, street and other background sound out of the audio before speech is recognized. **Normal** is the default; try **Strong** for loud backgrounds, or **Off** to compare. The first Start downloads its small model (0.5 MB).
+
 Some apps block audio capture (DRM-protected video, for example); LiveSub then receives only silence.
 
 ## Features
@@ -63,6 +65,7 @@ Some apps block audio capture (DRM-protected video, for example); LiveSub then r
   Each sentence gets its own line or card. Drag the corner to resize it (sideways for width, up or down for up to 8 lines), choose how many past subtitles you can scroll back to (10–200), and change text size, background and themes. Double-tap hides the controls.
 - **Live feed and history** in the app, saved on the phone. Tap a line to copy it.
 - **Quick Settings tile** to start and stop without opening the app.
+- **Background noise removal** before speech recognition (GTCRN speech-enhancement model, 0.5 MB): Off, Normal or Strong.
 - **Audio clean-up tuned for speech**: rumble filter, a boost for quiet or husky voices, and an optional noise gate.
 - **Simple settings** for subtitles, plus **Developer settings** for recognition tuning (pause length, restart timing, shortest sentence, handling of one-character results) and a recorder that saves exactly what the speech engine hears.
 
@@ -104,7 +107,7 @@ About-1-second models also download the Silero speech detector (under 1 MB).
 | FunASR model license | SenseVoice |
 | Moonshine Community License | Moonshine |
 | CC-BY-4.0 | Parakeet v3 |
-| MIT | GigaAM v3, Whisper, Silero speech detector |
+| MIT | GigaAM v3, Whisper, Silero speech detector, GTCRN noise remover |
 
 Translation packs are Google ML Kit models, about 30 MB each.
 
@@ -112,7 +115,7 @@ Translation packs are Google ML Kit models, about 30 MB each.
 
 ```mermaid
 flowchart LR
-    A[App audio or mic] --> B[16 kHz resampling<br/>and clean-up]
+    A[App audio or mic] --> B[16 kHz resampling,<br/>noise removal, clean-up]
     B --> C1[Instant:<br/>streaming recognizer]
     B --> C2[About 1 second:<br/>speech detector +<br/>whole-phrase model]
     C1 --> S[Whole sentences]
@@ -122,12 +125,12 @@ flowchart LR
     D --> F[Live feed and history]
 ```
 
-- **Capture** (`service/AudioCaptureService.kt`): a foreground service reads audio, converts it to 16 kHz mono with an anti-aliasing resampler, and applies the optional filter, boost and gate. It also forwards recognized speech to the translator and saves finished lines to history.
+- **Capture** (`service/AudioCaptureService.kt`): a foreground service reads audio, converts it to 16 kHz mono with an anti-aliasing resampler, removes background noise first (`audio/NoiseReducer.kt`), then applies the optional filter, boost and gate. It also forwards recognized speech to the translator and saves finished lines to history.
 - **Recognition** (`asr/`):
   - `SpeechRecognizerEngine.kt` runs the chosen model and emits draft and finished sentences in order. Instant models use the streaming recognizer; About-1-second models use `OfflinePhraseRecognizer.kt` (Silero speech detector plus a whole-phrase model).
-  - `SentenceAssembler.kt` joins pieces into sentences, and `NoiseTextFilter.kt` drops text that is really music or noise.
+  - `SentenceAssembler.kt` joins pieces into sentences (a piece in another alphabet starts a new one), and `NoiseTextFilter.kt` drops text that is really music or noise.
   - `ModelManager.kt` downloads, installs (only when complete) and selects models; each model lives in its own folder.
-- **Translation** (`translate/`): one ordered queue with a time limit, the heard language or ML Kit language detection for Auto-Detect, and clear messages when a language pack is missing.
+- **Translation** (`translate/`): one ordered queue with a time limit, the heard language (checked against the text's alphabet) or ML Kit language detection for Auto-Detect, and clear messages when a language pack is missing.
 - **Display** (`overlay/`, `ui/`): the overlay service and the app read the same results; older or out-of-order results are ignored. `overlay/SubtitlePager.kt` times Movie-style cards.
 
 ## Building

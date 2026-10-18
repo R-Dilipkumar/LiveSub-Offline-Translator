@@ -1,5 +1,7 @@
 package com.example.asr
 
+import com.example.text.WritingSystem
+
 /**
  * Joins the recognizer's pieces into whole sentences before they are translated.
  *
@@ -12,6 +14,12 @@ package com.example.asr
  * - the speaker stays quiet for [pauseMs] after a piece ([continuationPauseMs] if the piece
  *   clearly continues, e.g. ends in けど / て / "and" / "the"), or
  * - it gets long ([maxPieces] pieces or [maxLength] characters), so subtitles never wait too long.
+ *
+ * A piece in another writing system than the waiting ones (English after Korean) starts a new
+ * sentence instead (see [breakBefore]): one sentence is translated from one language.
+ * Each piece may carry the language the speech model heard; the sentence's language is the one
+ * most of its letters were heard in, not just the last piece's (a short noisy last piece is
+ * often misheard as another language).
  *
  * While a sentence is waiting, its text so far is still shown as a live draft.
  * The whole sentence keeps the utterance id of its first piece, so the display treats it as
@@ -27,36 +35,55 @@ class SentenceAssembler(
     // Weighted: a CJK character counts as 2
     private val maxLength: Int = 160
 ) {
-    data class Sentence(val text: String, val utteranceId: Long, val isFinal: Boolean)
+    data class Sentence(val text: String, val utteranceId: Long, val isFinal: Boolean, val language: String? = null)
+
+    private class Piece(val text: String, val language: String?)
 
     /** When false, every piece is passed on as a finished sentence (the old behaviour). */
     @Volatile var isEnabled: Boolean = true
 
-    private val pieces = mutableListOf<String>()
+    private val pieces = mutableListOf<Piece>()
     private var sentenceId = 0L
     private var lastPieceAtMs = 0L
 
     /** Text of the waiting pieces, or "" if none. */
     fun pendingText(): String = joinAll(pieces)
 
-    /** A finished piece from the recognizer. Returns the sentence so far, final if complete. */
-    fun onPiece(text: String, utteranceId: Long, nowMs: Long): Sentence {
-        if (!isEnabled && pieces.isEmpty()) return Sentence(text, utteranceId, isFinal = true)
+    /**
+     * Call before [onPiece]. If [text] is in another writing system than the waiting pieces
+     * (both with at least two letters), the waiting sentence ends here and is returned, so the
+     * new piece starts its own sentence. Returns null otherwise.
+     */
+    fun breakBefore(text: String): Sentence? {
+        if (pieces.isEmpty()) return null
+        val waiting = joinAll(pieces)
+        if (WritingSystem.letterCount(text) < 2 || WritingSystem.letterCount(waiting) < 2) return null
+        val newScript = WritingSystem.mainOf(text) ?: return null
+        val waitingScript = WritingSystem.mainOf(waiting) ?: return null
+        return if (newScript != waitingScript) takeSentence() else null
+    }
+
+    /**
+     * A finished piece from the recognizer, with the [language] the speech model heard (null if
+     * it doesn't say). Returns the sentence so far, final if complete.
+     */
+    fun onPiece(text: String, utteranceId: Long, nowMs: Long, language: String? = null): Sentence {
+        if (!isEnabled && pieces.isEmpty()) return Sentence(text, utteranceId, isFinal = true, language = language)
         if (pieces.isEmpty()) sentenceId = utteranceId
-        pieces.add(text)
+        pieces.add(Piece(text, language))
         lastPieceAtMs = nowMs
         val joined = joinAll(pieces)
         val complete = !isEnabled ||
             looksComplete(joined) ||
             pieces.size >= maxPieces ||
             weightedLength(joined) >= maxLength
-        return if (complete) takeSentence() else Sentence(joined, sentenceId, isFinal = false)
+        return if (complete) takeSentence() else Sentence(joined, sentenceId, isFinal = false, language = sentenceLanguage())
     }
 
     /** The recognizer's live text for the piece in progress, shown after the waiting pieces. */
     fun onDraft(text: String, utteranceId: Long): Sentence {
         if (pieces.isEmpty()) return Sentence(text, utteranceId, isFinal = false)
-        return Sentence(SpeechRecognizerEngine.joinFragments(joinAll(pieces), text), sentenceId, isFinal = false)
+        return Sentence(SpeechRecognizerEngine.joinFragments(joinAll(pieces), text), sentenceId, isFinal = false, language = sentenceLanguage())
     }
 
     /**
@@ -65,7 +92,7 @@ class SentenceAssembler(
      */
     fun onTick(nowMs: Long, isSpeaking: Boolean): Sentence? {
         if (pieces.isEmpty() || isSpeaking) return null
-        val wait = if (looksUnfinished(pieces.last())) continuationPauseMs else pauseMs
+        val wait = if (looksUnfinished(pieces.last().text)) continuationPauseMs else pauseMs
         return if (nowMs - lastPieceAtMs >= wait) takeSentence() else null
     }
 
@@ -77,23 +104,34 @@ class SentenceAssembler(
     }
 
     private fun takeSentence(): Sentence {
-        val sentence = Sentence(joinAll(pieces), sentenceId, isFinal = true)
+        val sentence = Sentence(joinAll(pieces), sentenceId, isFinal = true, language = sentenceLanguage())
         pieces.clear()
         return sentence
     }
 
-    private fun joinAll(parts: List<String>): String =
-        parts.fold("") { acc, part -> SpeechRecognizerEngine.joinFragments(acc, part.trim()) }
+    // The language most of the waiting letters were heard in (pieces without one don't count)
+    private fun sentenceLanguage(): String? =
+        pieces.filter { it.language != null }
+            .groupBy { it.language }
+            .maxByOrNull { (_, heard) -> heard.sumOf { maxOf(1, WritingSystem.letterCount(it.text)) } }
+            ?.key
+
+    private fun joinAll(parts: List<Piece>): String =
+        parts.fold("") { acc, part -> SpeechRecognizerEngine.joinFragments(acc, part.text.trim()) }
 
     companion object {
         private val SENTENCE_PUNCTUATION = setOf('.', '!', '?', '。', '！', '？', '…')
         private val CLOSING_MARKS = charArrayOf('"', '\'', '」', '』', ')', '）')
 
-        // Common ways a spoken Japanese sentence ends (polite and casual forms, final particles).
-        // Left out on purpose: の, な and さ, which also end mid-sentence phrases (私の, 大きな).
+        // Common ways a spoken Japanese sentence ends (polite and casual forms with their final
+        // particles), which end a sentence at once. A lone final kana (だ, よ, ね, か, わ, ぞ, ぜ)
+        // is left out: many mid-sentence words end in one (まだ, ただ, なんか, 誰か, 静か), so a
+        // sentence ending in one waits for the pause instead.
         private val JAPANESE_ENDINGS = listOf(
             "です", "ます", "ました", "でした", "ません", "でしょう", "ましょう", "ください",
-            "だ", "だった", "よ", "ね", "よね", "か", "かな", "わ", "ぞ", "ぜ"
+            "ですか", "ますか", "ませんか", "ましたか", "でしたか", "でしょうか", "ましょうか",
+            "ですね", "ますね", "ですよ", "ますよ", "よね", "かな", "かしら",
+            "だった", "だよ", "だね", "だな", "だぞ", "だぜ", "だわ", "のよ", "のね", "わよ", "わね"
         )
 
         // Endings that mean the sentence goes on: te-form, conjunctions and case particles
@@ -187,10 +225,7 @@ class SentenceAssembler(
             return lastWord in ENGLISH_CONTINUATIONS
         }
 
-        private fun hasKana(text: String): Boolean = text.any {
-            val script = Character.UnicodeScript.of(it.code)
-            script == Character.UnicodeScript.HIRAGANA || script == Character.UnicodeScript.KATAKANA
-        }
+        private fun hasKana(text: String): Boolean = WritingSystem.hasKana(text)
 
         private fun weightedLength(text: String): Int = text.sumOf { c -> if (c.code >= 0x2E80) 2 else 1 }
     }
