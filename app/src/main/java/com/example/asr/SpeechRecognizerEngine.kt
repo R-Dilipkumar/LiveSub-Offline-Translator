@@ -820,6 +820,9 @@ class SpeechRecognizerEngine(
                         emitFinalUtterance(text, currentUtteranceId)
                         currentUtteranceId = utteranceEpochCounter.incrementAndGet()
                     }
+                    // getFinalResult() flushes the feature pipeline; reset so the same loaded
+                    // recognizer can be reused when the next capture session starts.
+                    recognizer.reset()
                 } catch (t: Throwable) {
                     Log.w(TAG, "Could not flush Vosk recognizer: " + t.message)
                 }
