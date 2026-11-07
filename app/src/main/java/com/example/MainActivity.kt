@@ -44,6 +44,9 @@ class MainActivity : ComponentActivity() {
     }
 
     private var pendingMicCapture = false
+    // Capture must wait until the user has granted the overlay permission.
+    // Nullable distinguishes no pending request from a pending microphone=false request.
+    private var pendingCaptureAfterOverlay: Boolean? = null
 
     // Permission launcher for RECORD_AUDIO and POST_NOTIFICATIONS
     private val permissionLauncher = registerForActivityResult(
@@ -68,9 +71,20 @@ class MainActivity : ComponentActivity() {
         ActivityResultContracts.StartActivityForResult()
     ) {
         if (hasOverlayPermission()) {
-            viewModel.startFloatingOverlay()
-            Toast.makeText(this, "Floating subtitles on", Toast.LENGTH_SHORT).show()
+            // Clear any stale permission warning as soon as Android confirms the grant.
+            viewModel.dismissError()
+            val pendingCapture = pendingCaptureAfterOverlay
+            if (pendingCapture != null) {
+                pendingCaptureAfterOverlay = null
+                // Resume the Start subtitles flow only after overlay access is granted.
+                checkAndRequestPermissions(pendingCapture)
+            } else {
+                // The user opened the permission screen from the floating-overlay toggle.
+                viewModel.startFloatingOverlay()
+                Toast.makeText(this, "Floating subtitles on", Toast.LENGTH_SHORT).show()
+            }
         } else {
+            pendingCaptureAfterOverlay = null
             viewModel.showError("Floating window overlay permission was not granted.")
         }
     }
@@ -136,10 +150,6 @@ class MainActivity : ComponentActivity() {
                         }
                     }
 
-                    val explanation = "Allow 'Display over other apps' so subtitles can float over videos and games."
-                    Toast.makeText(this@MainActivity, explanation, Toast.LENGTH_LONG).show()
-                    viewModel.showError(explanation)
-
                     try {
                         val intent = Intent(
                             Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
@@ -152,6 +162,7 @@ class MainActivity : ComponentActivity() {
                     }
                 }
             } else {
+                viewModel.dismissError()
                 viewModel.startFloatingOverlay()
                 if (!quiet) Toast.makeText(this, "Floating subtitles on", Toast.LENGTH_SHORT).show()
             }
@@ -161,6 +172,16 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun checkAndRequestPermissions(isMic: Boolean = false) {
+        // Overlay permission is part of the Start subtitles flow. Request it first so
+        // the capture flow cannot begin while the required floating-window access is missing.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !hasOverlayPermission()) {
+            pendingCaptureAfterOverlay = isMic
+            requestFloatingOverlay()
+            return
+        }
+
+        pendingCaptureAfterOverlay = null
+        viewModel.dismissError()
         pendingMicCapture = isMic
         val permissionsToRequest = mutableListOf<String>()
 
