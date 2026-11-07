@@ -42,6 +42,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import android.provider.OpenableColumns
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -79,7 +80,11 @@ fun ModelManagementScreen(
     val voskImporting by viewModel.voskModelStore.importing.collectAsStateWithLifecycle()
     val voskImportError by viewModel.voskModelStore.error.collectAsStateWithLifecycle()
     val voskZipPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
-        if (uri != null) viewModel.importVoskModel(uri, uri.lastPathSegment)
+        if (uri != null) {
+            val fileName = context.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
+                ?.use { cursor -> if (cursor.moveToFirst()) cursor.getString(0) else null }
+            viewModel.importVoskModel(uri, fileName)
+        }
     }    val isCapturing by viewModel.isCapturing.collectAsStateWithLifecycle()
 
     val packLanguages = viewModel.targetAvailableLanguages
@@ -137,7 +142,7 @@ fun ModelManagementScreen(
             val errorModelId = lastDownloadId ?: selectedAsrModel.id
             SpeechModelCard(
                 model = model,
-                isInUse = isInstalled && model.mode == mode && model.id == selectedAsrModel.id,
+                isInUse = selectedVoskId == null && isInstalled && model.mode == mode && model.id == selectedAsrModel.id,
                 pickedForOtherLatency = if (isInstalled && isChosenForItsLatency && model.mode != mode) latencyLabel(model.mode) else null,
                 switchesLatencyTo = if (model.mode != mode) latencyLabel(model.mode) else null,
                 isInstalled = isInstalled,
