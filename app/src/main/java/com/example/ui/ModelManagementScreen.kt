@@ -85,7 +85,8 @@ fun ModelManagementScreen(
                 ?.use { cursor -> if (cursor.moveToFirst()) cursor.getString(0) else null }
             viewModel.importVoskModel(uri, fileName)
         }
-    }    val isCapturing by viewModel.isCapturing.collectAsStateWithLifecycle()
+    }
+    val isCapturing by viewModel.isCapturing.collectAsStateWithLifecycle()
 
     val packLanguages = viewModel.targetAvailableLanguages
     val downloadedLanguages by viewModel.downloadedLanguages.collectAsStateWithLifecycle()
