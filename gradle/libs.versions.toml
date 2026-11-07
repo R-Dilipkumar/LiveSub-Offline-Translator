@@ -44,7 +44,6 @@ mlkitTranslate = "17.0.3"
 mlkitLanguageId = "17.0.6"
 commonsCompress = "1.27.1"
 sherpaOnnx = "8.6.10"
-vosk = "0.3.75"
 
 
 [libraries]
@@ -104,7 +103,6 @@ mlkit-translate = { group = "com.google.mlkit", name = "translate", version.ref 
 mlkit-language-id = { group = "com.google.mlkit", name = "language-id", version.ref = "mlkitLanguageId" }
 commons-compress = { group = "org.apache.commons", name = "commons-compress", version.ref = "commonsCompress" }
 sherpa-onnx = { group = "com.bihe0832.android", name = "lib-sherpa-onnx", version.ref = "sherpaOnnx" }
-vosk-android = { group = "com.alphacephei", name = "vosk-android", version.ref = "vosk", ext = "aar" }
 
 
 [plugins]
