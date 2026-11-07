@@ -109,6 +109,7 @@ dependencies {
   implementation(libs.mlkit.language.id)
   implementation(libs.commons.compress)
   implementation(libs.sherpa.onnx)
+  implementation(libs.vosk.android)
   testImplementation(libs.androidx.compose.ui.test.junit4)
   testImplementation(libs.androidx.core)
   testImplementation(libs.androidx.junit)
