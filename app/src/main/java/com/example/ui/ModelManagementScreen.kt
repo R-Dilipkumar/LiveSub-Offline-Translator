@@ -40,6 +40,9 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import android.provider.OpenableColumns
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -72,6 +75,17 @@ fun ModelManagementScreen(
     val lastDownloadId by viewModel.lastAsrDownloadId.collectAsStateWithLifecycle()
     val availableStorageMb by viewModel.availableStorageMb.collectAsStateWithLifecycle()
     val context = LocalContext.current
+    val voskModels by viewModel.voskModelStore.models.collectAsStateWithLifecycle()
+    val selectedVoskId by viewModel.voskModelStore.selectedId.collectAsStateWithLifecycle()
+    val voskImporting by viewModel.voskModelStore.importing.collectAsStateWithLifecycle()
+    val voskImportError by viewModel.voskModelStore.error.collectAsStateWithLifecycle()
+    val voskZipPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) {
+            val fileName = context.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
+                ?.use { cursor -> if (cursor.moveToFirst()) cursor.getString(0) else null }
+            viewModel.importVoskModel(uri, fileName)
+        }
+    }
     val isCapturing by viewModel.isCapturing.collectAsStateWithLifecycle()
 
     val packLanguages = viewModel.targetAvailableLanguages
@@ -129,7 +143,7 @@ fun ModelManagementScreen(
             val errorModelId = lastDownloadId ?: selectedAsrModel.id
             SpeechModelCard(
                 model = model,
-                isInUse = isInstalled && model.mode == mode && model.id == selectedAsrModel.id,
+                isInUse = selectedVoskId == null && isInstalled && model.mode == mode && model.id == selectedAsrModel.id,
                 pickedForOtherLatency = if (isInstalled && isChosenForItsLatency && model.mode != mode) latencyLabel(model.mode) else null,
                 switchesLatencyTo = if (model.mode != mode) latencyLabel(model.mode) else null,
                 isInstalled = isInstalled,
@@ -153,6 +167,12 @@ fun ModelManagementScreen(
         }
         }
 
+        item {
+            VoskModelsCard(voskModels, selectedVoskId, voskImporting, voskImportError,
+                onImport = { voskZipPicker.launch(arrayOf("application/zip", "application/x-zip-compressed", "application/octet-stream")) },
+                onSelect = { viewModel.selectVoskModel(it) },
+                onDelete = { viewModel.deleteVoskModel(it) })
+        }
         item {
             SectionHeader(
                 icon = Icons.Default.Translate,
@@ -237,6 +257,32 @@ fun LatencyPreference(
     }
 }
 
+@Composable
+private fun VoskModelsCard(models: List<com.example.asr.VoskLocalModel>, selectedId: String?, isImporting: Boolean, errorMessage: String?, onImport: () -> Unit, onSelect: (String?) -> Unit, onDelete: (String) -> Unit) {
+    Card(modifier = Modifier.fillMaxWidth().testTag("vosk_models_card"), shape = RoundedCornerShape(16.dp), border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)) {
+        Column(modifier = Modifier.padding(14.dp)) {
+            Text("Vosk models", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+            Text("Import a downloaded ZIP model from your device. Runs fully offline.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Spacer(modifier = Modifier.height(10.dp))
+            if (models.isEmpty()) Text("No local Vosk models imported yet.", style = MaterialTheme.typography.bodyMedium)
+            models.forEach { model ->
+                Row(modifier = Modifier.fillMaxWidth().padding(vertical = 5.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(model.name, style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.SemiBold)
+                        Text(if (selectedId == model.id) "In use" else "Imported locally", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
+                    }
+                    if (selectedId != model.id) OutlinedButton(onClick = { onSelect(model.id) }) { Text("Use") }
+                    IconButton(onClick = { onDelete(model.id) }) { Icon(Icons.Default.DeleteOutline, contentDescription = "Delete Vosk model", tint = MaterialTheme.colorScheme.error) }
+                }
+            }
+            if (selectedId != null) OutlinedButton(onClick = { onSelect(null) }, modifier = Modifier.fillMaxWidth()) { Text("Switch back to Sherpa-ONNX models") }
+            Button(onClick = onImport, enabled = !isImporting, modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(12.dp)) {
+                if (isImporting) { CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp); Spacer(modifier = Modifier.width(8.dp)); Text("Importing ZIP…") } else Text("Import Vosk ZIP model")
+            }
+            if (errorMessage != null) Text(errorMessage, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 6.dp))
+        }
+    }
+}
 @Composable
 private fun StorageSummary(freeMb: Long) {
     val low = freeMb in 1 until 500

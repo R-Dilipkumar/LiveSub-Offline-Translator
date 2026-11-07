@@ -102,6 +102,7 @@ class AudioCaptureService : Service() {
         // NPE under concurrent access (e.g., Quick Settings tile + main app starting simultaneously).
         // Pattern mirrors AppDatabase.getInstance() which already does this correctly.
         @Volatile private var sharedModelManager: ModelManager? = null
+        @Volatile private var sharedVoskModelStore: com.example.asr.VoskModelStore? = null
         // The noise remover is fetched at Start at most once per run, so a bad connection
         // doesn't slow every Start
         @Volatile private var triedDenoiserDownload = false
@@ -116,11 +117,20 @@ class AudioCaptureService : Service() {
             }
         }
 
+        fun getVoskModelStore(context: Context): com.example.asr.VoskModelStore {
+            return sharedVoskModelStore ?: synchronized(this) {
+                sharedVoskModelStore ?: com.example.asr.VoskModelStore(context.applicationContext).also {
+                    sharedVoskModelStore = it
+                }
+            }
+        }
+
         fun getSpeechEngine(context: Context): SpeechRecognizerEngine {
             return sharedSpeechEngine ?: synchronized(this) {
                 sharedSpeechEngine ?: SpeechRecognizerEngine(
                     context.applicationContext,
-                    getModelManager(context)
+                    getModelManager(context),
+                    getVoskModelStore(context)
                 ).also {
                     sharedSpeechEngine = it
                 }

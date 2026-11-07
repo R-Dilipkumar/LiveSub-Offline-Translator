@@ -11,6 +11,9 @@ import com.k2fsa.sherpa.onnx.OnlineModelConfig
 import com.k2fsa.sherpa.onnx.OnlineRecognizer
 import com.k2fsa.sherpa.onnx.OnlineRecognizerConfig
 import com.k2fsa.sherpa.onnx.OnlineStream
+import org.vosk.Model as VoskNativeModel
+import org.vosk.Recognizer as VoskNativeRecognizer
+import org.json.JSONObject
 import com.k2fsa.sherpa.onnx.OnlineTransducerModelConfig
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -51,7 +54,8 @@ sealed class RecognizerState {
 
 class SpeechRecognizerEngine(
     private val context: Context,
-    private val modelManager: ModelManager
+    private val modelManager: ModelManager,
+    private val voskModelStore: VoskModelStore
 ) {
     private val TAG = "SpeechRecognizerEngine"
     private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
@@ -81,6 +85,13 @@ class SpeechRecognizerEngine(
     private var onlineStream: OnlineStream? = null
     // Accuracy mode: speech detector + whole-phrase model. Set instead of onlineRecognizer.
     private var offlineRecognizer: OfflinePhraseRecognizer? = null
+    private var voskModel: VoskNativeModel? = null
+    private var voskRecognizer: VoskNativeRecognizer? = null
+    // Vosk performs best with steady ~100 ms PCM frames. AudioRecord may deliver
+    // irregularly-sized buffers, so assemble them here and reuse one byte array.
+    private val voskPcmChunk = ByteArray(VOSK_CHUNK_BYTES)
+    private var voskPcmChunkSize = 0
+    private var lastVoskPartial = ""
     private val recognizerLock = Any()
 
     /**
@@ -154,6 +165,9 @@ class SpeechRecognizerEngine(
 
     // Consistent buffer size of 0.1s (1600 samples at 16kHz 16-bit mono) aligned to 2-byte boundaries
     companion object {
+        private const val VOSK_CHUNK_SAMPLES = 1600 // 100 ms at 16 kHz
+        private const val VOSK_CHUNK_BYTES = VOSK_CHUNK_SAMPLES * 2
+
         const val CHUNK_SIZE_SAMPLES = 1600
         const val DEFAULT_SILENCE_ENDPOINT_DELAY = 0.8f
         const val DEFAULT_MAX_UTTERANCE_WINDOW = 15.0f
@@ -276,12 +290,49 @@ class SpeechRecognizerEngine(
     suspend fun initEngine(): Boolean = withContext(Dispatchers.IO) {
         initMutex.withLock {
             val hasRecognizer = synchronized(recognizerLock) {
-                (onlineRecognizer != null && onlineStream != null) || offlineRecognizer != null
+                (onlineRecognizer != null && onlineStream != null) || offlineRecognizer != null || voskRecognizer != null
             }
 
             if (hasRecognizer && isCapturing) {
                 Log.d(TAG, "initEngine during capture: keeping the running recognizer (${loadedConfig?.modelId})")
                 return@withLock true
+            }
+
+
+            val selectedVosk = voskModelStore.selected()
+            if (selectedVosk != null) {
+                val wantedVoskId = "vosk_" + selectedVosk.id
+                val wantedVosk = LoadedConfig(wantedVoskId, 0f, 0f, 0f, 0f)
+                if (hasRecognizer && loadedConfig == wantedVosk) {
+                    if (_engineState.value !is RecognizerState.Listening) _engineState.value = RecognizerState.Ready
+                    return@withLock true
+                }
+                _engineState.value = RecognizerState.Initializing
+                return@withLock try {
+                    val loaded = loadNative(wantedVoskId) { VoskNativeModel(selectedVosk.directory.absolutePath) }
+                    val recognizer = VoskNativeRecognizer(loaded, 16000.0f).apply {
+                        // We only need transcript text; word timings and alternatives add work
+                        // without being used by LiveSub's subtitle pipeline.
+                        setWords(false)
+                        setMaxAlternatives(0)
+                    }
+                    synchronized(recognizerLock) {
+                        releaseRecognizersLocked()
+                        voskModel = loaded
+                        voskRecognizer = recognizer
+                        loadedConfig = wantedVosk
+                        resetUtteranceState()
+                    }
+                    _engineState.value = RecognizerState.Ready
+                    Log.i(TAG, "Vosk recognizer ready: " + selectedVosk.name)
+                    true
+                } catch (t: Throwable) {
+                    val error = "Failed to load Vosk model: " + t.localizedMessage
+                    Log.e(TAG, error, t)
+                    _engineState.value = RecognizerState.Error(error)
+                    NotificationHelper.showErrorNotification(context, "Vosk Model Error", error)
+                    false
+                }
             }
 
             val resolved = resolveModelForLoad()
@@ -449,6 +500,8 @@ class SpeechRecognizerEngine(
         phraseAssembler.clear()
         noiseTextFilter.reset()
         audioFeedingStarted = false
+        voskPcmChunkSize = 0
+        lastVoskPartial = ""
         synchronized(pcmChunkAccumulator) {
             pcmChunkAccumulator.clear()
         }
@@ -458,7 +511,60 @@ class SpeechRecognizerEngine(
      * Feeds 16 kHz float PCM samples to the speech recognizer in consistent 0.1s chunks (1600 samples).
      * Uses in-place reusable buffer with ArrayDeque O(1) removal to eliminate allocation GC overhead.
      */
+    /** Must be called with recognizerLock held. */
+    private fun processVoskChunk(recognizer: VoskNativeRecognizer, length: Int) {
+        val accepted = recognizer.acceptWaveForm(voskPcmChunk, length)
+        if (accepted) {
+            val text = JSONObject(recognizer.result).optString("text").trim()
+            if (text.isNotBlank()) {
+                val filtered = noiseTextFilter.filter(text, learn = true)
+                if (filtered != null && SpeechValidator.isGenuineSpeech(filtered)) {
+                    emitFinalUtterance(filtered, currentUtteranceId)
+                }
+            }
+            currentUtteranceId = utteranceEpochCounter.incrementAndGet()
+            lastVoskPartial = ""
+            _partialTextFlow.value = ""
+            currentRawDraft = ""
+        } else {
+            val partial = JSONObject(recognizer.partialResult).optString("partial").trim()
+            // Vosk often returns the same partial on consecutive frames. Avoid filling the
+            // event channel with duplicates and needlessly waking the translation pipeline.
+            if (partial != lastVoskPartial) {
+                lastVoskPartial = partial
+                if (partial.isNotBlank() && SpeechValidator.isGenuineSpeech(partial)) {
+                    currentRawDraft = partial
+                    _partialTextFlow.value = partial
+                    emitPartialUtterance(partial, currentUtteranceId)
+                }
+            }
+        }
+    }
+
     fun feedAudioSamples(samples: FloatArray) {
+        synchronized(recognizerLock) {
+            val vosk = voskRecognizer
+            if (vosk != null) {
+                try {
+                    _engineState.value = RecognizerState.Listening
+                    // Convert float PCM to little-endian 16-bit PCM and feed consistent
+                    // 100 ms frames, matching Vosk's recommended streaming usage.
+                    for (sample in samples) {
+                        val pcm = (sample.coerceIn(-1f, 1f) * 32767f).toInt()
+                        voskPcmChunk[voskPcmChunkSize++] = (pcm and 0xFF).toByte()
+                        voskPcmChunk[voskPcmChunkSize++] = ((pcm shr 8) and 0xFF).toByte()
+                        if (voskPcmChunkSize == VOSK_CHUNK_BYTES) {
+                            processVoskChunk(vosk, voskPcmChunkSize)
+                            voskPcmChunkSize = 0
+                        }
+                    }
+                } catch (t: Throwable) {
+                    Log.e(TAG, "Vosk recognition error", t)
+                    _engineState.value = RecognizerState.Error("Vosk recognition error: " + t.localizedMessage)
+                }
+                return
+            }
+        }
         // Accuracy mode: the speech detector buffers audio itself
         synchronized(recognizerLock) {
             val phraseRecognizer = offlineRecognizer
@@ -741,6 +847,28 @@ class SpeechRecognizerEngine(
      */
     fun flushCurrentSegment() {
         synchronized(recognizerLock) {
+            voskRecognizer?.let { recognizer ->
+                try {
+                    // Don't discard the final <100 ms left in the accumulator when Stop is pressed.
+                    if (voskPcmChunkSize > 0) {
+                        processVoskChunk(recognizer, voskPcmChunkSize)
+                        voskPcmChunkSize = 0
+                    }
+                    val text = JSONObject(recognizer.finalResult).optString("text").trim()
+                    if (text.isNotBlank() && SpeechValidator.isGenuineSpeech(text)) {
+                        emitFinalUtterance(text, currentUtteranceId)
+                        currentUtteranceId = utteranceEpochCounter.incrementAndGet()
+                    }
+                    // Reuse the loaded model and recognizer for the next capture session.
+                    recognizer.reset()
+                } catch (t: Throwable) {
+                    Log.w(TAG, "Could not flush Vosk recognizer: " + t.message)
+                }
+                lastVoskPartial = ""
+                _partialTextFlow.value = ""
+                currentRawDraft = ""
+                return
+            }
             offlineRecognizer?.let { phraseRecognizer ->
                 val now = System.currentTimeMillis()
                 phraseRecognizer.flush().forEach { handlePhrase(it, now) }
@@ -795,8 +923,12 @@ class SpeechRecognizerEngine(
             Log.e(TAG, "Error releasing recognizer native pointers", t)
         }
         offlineRecognizer?.release()
+        try { voskRecognizer?.close() } catch (t: Throwable) { Log.w(TAG, "Error closing Vosk recognizer: " + t.message) }
+        try { voskModel?.close() } catch (t: Throwable) { Log.w(TAG, "Error closing Vosk model: " + t.message) }
         onlineStream = null
         onlineRecognizer = null
         offlineRecognizer = null
+        voskRecognizer = null
+        voskModel = null
     }
 }

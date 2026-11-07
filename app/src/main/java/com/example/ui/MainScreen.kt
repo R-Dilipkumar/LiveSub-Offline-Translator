@@ -239,6 +239,7 @@ private fun TranslateTab(
     val isModelInstalled by viewModel.isSelectedAsrModelInstalled.collectAsStateWithLifecycle()
     val settings by viewModel.appSettings.collectAsStateWithLifecycle()
     val speechModel by viewModel.selectedAsrModel.collectAsStateWithLifecycle()
+    val speechModelName by viewModel.selectedSpeechModelName.collectAsStateWithLifecycle()
     val latencyMode by viewModel.recognitionMode.collectAsStateWithLifecycle()
     val packWarning by viewModel.translationPackWarning.collectAsStateWithLifecycle()
     val modelTooSlow by viewModel.isSpeechModelTooSlow.collectAsStateWithLifecycle()
@@ -255,7 +256,7 @@ private fun TranslateTab(
 
         // The phrase model falls behind live speech on this phone: suggest a faster one
         if (isCapturing && modelTooSlow) {
-            SlowModelCard(modelName = speechModel.name, onOpenModels = onOpenModels)
+            SlowModelCard(modelName = speechModelName, onOpenModels = onOpenModels)
             Spacer(modifier = Modifier.height(10.dp))
         }
 
@@ -279,7 +280,7 @@ private fun TranslateTab(
         Spacer(modifier = Modifier.height(8.dp))
 
         SpeechModelLine(
-            modelName = speechModel.name,
+            modelName = speechModelName,
             latency = latencyLabel(latencyMode),
             isInstalled = isModelInstalled,
             help = languageHelp(sourceLang, speechModel),

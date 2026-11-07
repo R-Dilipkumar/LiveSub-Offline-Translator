@@ -109,6 +109,8 @@ dependencies {
   implementation(libs.mlkit.language.id)
   implementation(libs.commons.compress)
   implementation(libs.sherpa.onnx)
+  implementation("net.java.dev.jna:jna:5.18.1@aar")
+  implementation("com.alphacephei:vosk-android:0.3.75@aar")
   testImplementation(libs.androidx.compose.ui.test.junit4)
   testImplementation(libs.androidx.core)
   testImplementation(libs.androidx.junit)
