@@ -70,7 +70,7 @@ class AudioTranslatorViewModel(application: Application) : AndroidViewModel(appl
         viewModelScope.launch(Dispatchers.IO) {
             // Accuracy-mode models can be locked to the chosen spoken language
             speechEngine.spokenLanguageHint = sourceLanguage.value.takeUnless { it.isAutoDetect }?.code
-            if (!modelManager.isSelectedModelReady()) {
+            if (voskModelStore.selected() == null && !modelManager.isSelectedModelReady()) {
                 Log.w("AudioTranslatorViewModel", "Cannot initialize speech recognizer: selected model ${modelManager.selectedModel.value.id} is not installed")
                 return@launch
             }
