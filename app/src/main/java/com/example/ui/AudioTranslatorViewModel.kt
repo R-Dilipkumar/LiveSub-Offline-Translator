@@ -62,9 +62,18 @@ class AudioTranslatorViewModel(application: Application) : AndroidViewModel(appl
     val isSelectedAsrModelInstalled: StateFlow<Boolean> = combine(
         modelManager.hasScannedModels,
         modelManager.readyModelIds,
-        modelManager.selectedModel
-    ) { scanned, ready, selected -> !scanned || selected.id in ready }
+        modelManager.selectedModel,
+        voskModelStore.selectedId
+    ) { scanned, ready, selected, voskId -> voskId != null || !scanned || selected.id in ready }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), true)
+
+    val selectedSpeechModelName: StateFlow<String> = combine(
+        modelManager.selectedModel,
+        voskModelStore.models,
+        voskModelStore.selectedId
+    ) { sherpa, voskModels, voskId ->
+        voskModels.firstOrNull { it.id == voskId }?.name ?: sherpa.name
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), modelManager.selectedModel.value.name)
 
     fun initializeSpeechRecognizer() {
         viewModelScope.launch(Dispatchers.IO) {
