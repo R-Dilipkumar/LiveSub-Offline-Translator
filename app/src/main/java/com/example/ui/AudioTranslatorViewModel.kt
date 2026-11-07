@@ -34,6 +34,7 @@ class AudioTranslatorViewModel(application: Application) : AndroidViewModel(appl
 
     private val context: Context get() = getApplication()
     val modelManager: ModelManager = AudioCaptureService.getModelManager(context)
+    val voskModelStore: com.example.asr.VoskModelStore = AudioCaptureService.getVoskModelStore(context)
     val speechEngine: SpeechRecognizerEngine = AudioCaptureService.getSpeechEngine(context)
     val translatorEngine: LocalTranslatorEngine = AudioCaptureService.getTranslatorEngine(context)
     private val transcriptDao = AppDatabase.getInstance(context).transcriptDao()
@@ -302,10 +303,31 @@ class AudioTranslatorViewModel(application: Application) : AndroidViewModel(appl
     }
 
     fun selectAsrModel(model: AsrModelConfig) {
+        voskModelStore.select(null)
         modelManager.selectModel(model)
         // Load the new selection now if it is installed (no-op during capture; it then
         // takes effect on the next start).
         initializeSpeechRecognizer()
+    }
+
+
+    fun importVoskModel(uri: android.net.Uri, fileName: String?) {
+        viewModelScope.launch {
+            val imported = voskModelStore.importZip(uri, fileName)
+            if (imported) initializeSpeechRecognizer()
+        }
+    }
+
+    fun selectVoskModel(modelId: String?) {
+        voskModelStore.select(modelId)
+        initializeSpeechRecognizer()
+    }
+
+    fun deleteVoskModel(modelId: String) {
+        viewModelScope.launch {
+            voskModelStore.delete(modelId)
+            if (voskModelStore.selectedId.value == null) initializeSpeechRecognizer()
+        }
     }
 
     fun setSourceLanguage(lang: SupportedLanguage) {
