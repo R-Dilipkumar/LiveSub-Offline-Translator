@@ -2,6 +2,7 @@ package com.example
 
 import android.Manifest
 import android.app.Activity
+import android.app.AppOpsManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -9,6 +10,7 @@ import android.media.projection.MediaProjectionManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Process
 import android.provider.Settings
 import android.widget.Toast
 import androidx.activity.ComponentActivity
@@ -17,9 +19,12 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.lifecycleScope
 import com.example.ui.AudioTranslatorViewModel
 import com.example.ui.MainScreen
 import com.example.ui.theme.MyApplicationTheme
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
 
@@ -62,7 +67,7 @@ class MainActivity : ComponentActivity() {
     private val overlayPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && Settings.canDrawOverlays(this)) {
+        if (hasOverlayPermission()) {
             viewModel.startFloatingOverlay()
             Toast.makeText(this, "Floating subtitles on", Toast.LENGTH_SHORT).show()
         } else {
@@ -85,6 +90,26 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    /**
+     * Android can briefly report a stale overlay AppOp immediately after a permission
+     * change or when returning from Settings. Check the public API first, then the
+     * authoritative AppOps mode on Android 10+ before treating the permission as absent.
+     */
+    private fun hasOverlayPermission(): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return true
+        if (Settings.canDrawOverlays(this)) return true
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val appOps = getSystemService(AppOpsManager::class.java) ?: return false
+            return appOps.unsafeCheckOpNoThrow(
+                AppOpsManager.OPSTR_SYSTEM_ALERT_WINDOW,
+                Process.myUid(),
+                packageName
+            ) == AppOpsManager.MODE_ALLOWED
+        }
+        return false
+    }
+
     /** Opens the floating subtitles together with capture, unless turned off in Settings. */
     private fun openOverlayIfEnabled() {
         if (viewModel.appSettings.value.isAutoOverlayEnabled) {
@@ -94,21 +119,37 @@ class MainActivity : ComponentActivity() {
 
     fun requestFloatingOverlay(quiet: Boolean = false) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            if (!Settings.canDrawOverlays(this)) {
-                // Requirement 2: Show explanatory snackbar and trigger explicit Intent with package URI
-                val explanation = "Allow 'Display over other apps' so subtitles can float over videos and games."
-                Toast.makeText(this, explanation, Toast.LENGTH_LONG).show()
-                viewModel.showError(explanation)
+            if (!hasOverlayPermission()) {
+                // Give Android/OEM permission state a moment to settle before opening
+                // Settings. This avoids sending users to Settings for a stale false result.
+                lifecycleScope.launch {
+                    repeat(4) {
+                        delay(250)
+                        if (hasOverlayPermission()) {
+                            viewModel.startFloatingOverlay()
+                            if (!quiet) Toast.makeText(
+                                this@MainActivity,
+                                "Floating subtitles on",
+                                Toast.LENGTH_SHORT
+                            ).show()
+                            return@launch
+                        }
+                    }
 
-                try {
-                    val intent = Intent(
-                        Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                        Uri.parse("package:$packageName")
-                    )
-                    overlayPermissionLauncher.launch(intent)
-                } catch (e: Exception) {
-                    val fallbackIntent = Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION)
-                    overlayPermissionLauncher.launch(fallbackIntent)
+                    val explanation = "Allow 'Display over other apps' so subtitles can float over videos and games."
+                    Toast.makeText(this@MainActivity, explanation, Toast.LENGTH_LONG).show()
+                    viewModel.showError(explanation)
+
+                    try {
+                        val intent = Intent(
+                            Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                            Uri.parse("package:$packageName")
+                        )
+                        overlayPermissionLauncher.launch(intent)
+                    } catch (e: Exception) {
+                        val fallbackIntent = Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION)
+                        overlayPermissionLauncher.launch(fallbackIntent)
+                    }
                 }
             } else {
                 viewModel.startFloatingOverlay()
